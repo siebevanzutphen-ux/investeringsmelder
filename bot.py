@@ -24,7 +24,7 @@ WATCHLIST = [
     "XLK", "XLF", "XLV", "XLE", "XLU", "XLP", "XLI",
 ]
 
-MIN_DALING = 8.0        # % daling minimum
+MIN_DALING = 2.0        # % daling minimum (tijdelijk verlaagd voor test)
 MIN_MARKTCAP = 10e9     # minimaal €10 miljard marktcap
 MIN_LEEFTIJD_JAAR = 10  # bedrijf minimaal 10 jaar oud
 

@@ -226,6 +226,32 @@ def analyse_aandeel(ticker, forceer=False):
         doel = info.get("targetMeanPrice")
         opwaarts = (doel / prijs_nu - 1) * 100 if (doel and prijs_nu) else None
 
+        # ETF: waaruit bestaat het fonds? (holdings + sectoren + omschrijving)
+        etf_holdings = []
+        etf_sectors = []
+        etf_desc = None
+        if is_etf:
+            try:
+                fd = stock.funds_data
+                etf_desc = getattr(fd, "description", None)
+                th = getattr(fd, "top_holdings", None)
+                if th is not None and not th.empty:
+                    for sym, rij in th.head(10).iterrows():
+                        etf_holdings.append({
+                            "symbool": str(sym),
+                            "naam": rij.get("Name") or rij.get("name") or "",
+                            "pct": (float(rij.get("Holding Percent")) * 100)
+                            if rij.get("Holding Percent") is not None else None,
+                        })
+                sw = getattr(fd, "sector_weightings", None)
+                if isinstance(sw, dict) and sw:
+                    etf_sectors = sorted(
+                        ((naam, gewicht * 100) for naam, gewicht in sw.items() if gewicht),
+                        key=lambda x: x[1], reverse=True,
+                    )
+            except Exception as e:
+                print(f"ETF-holdings ophalen mislukt voor {ticker}: {e}")
+
         return {
             "ticker": ticker,
             "naam": info.get("longName") or info.get("shortName") or ticker,
@@ -281,8 +307,11 @@ def analyse_aandeel(ticker, forceer=False):
             "opwaarts": opwaarts,
             "advies": info.get("recommendationKey"),
             "n_analisten": info.get("numberOfAnalystOpinions"),
-            "omschrijving": info.get("longBusinessSummary"),
+            "omschrijving": etf_desc or info.get("longBusinessSummary"),
             "website": info.get("website"),
+            # ETF samenstelling
+            "top_holdings": etf_holdings,
+            "sector_weights": etf_sectors,
         }
 
     except Exception as e:
@@ -294,6 +323,29 @@ ADVIES_NL = {
     "strong_buy": "sterk kopen", "buy": "kopen", "hold": "houden",
     "underperform": "onderpresteren", "sell": "verkopen", "none": "geen advies",
 }
+
+SECTOR_NL = {
+    "technology": "Technologie",
+    "financial_services": "Financieel",
+    "financial": "Financieel",
+    "healthcare": "Gezondheidszorg",
+    "consumer_cyclical": "Consument (cyclisch)",
+    "consumer_defensive": "Consument (defensief)",
+    "industrials": "Industrie",
+    "communication_services": "Communicatie",
+    "energy": "Energie",
+    "utilities": "Nutsbedrijven",
+    "real_estate": "Vastgoed",
+    "realestate": "Vastgoed",
+    "basic_materials": "Basismaterialen",
+}
+
+
+def sector_nl(naam):
+    if not naam:
+        return "Onbekend"
+    sleutel = str(naam).lower().replace(" ", "_")
+    return SECTOR_NL.get(sleutel, str(naam).replace("_", " ").title())
 
 
 def kort_omschrijving(tekst, maxlen=320):
@@ -339,6 +391,35 @@ def format_bericht(k, test=False):
         if k.get("industrie"):
             sector_regel += f" · {esc(k['industrie'])}"
         regels.append(f"Sector: {sector_regel}")
+
+    # ---- Wat doet het / waaruit bestaat het (bovenaan, want belangrijk) ----
+    if is_etf:
+        holdings = k.get("top_holdings") or []
+        if holdings:
+            regels.append("")
+            regels.append("🧩 <b>Waaruit bestaat dit fonds?</b> (grootste belangen)")
+            for h in holdings:
+                naam = esc(h["naam"]) if h.get("naam") else esc(h["symbool"])
+                sym = f" ({esc(h['symbool'])})" if h.get("naam") and h.get("symbool") else ""
+                pctstr = f" — {pct(h['pct'])}" if h.get("pct") is not None else ""
+                regels.append(f"• {naam}{sym}{pctstr}")
+        sectoren = k.get("sector_weights") or []
+        if sectoren:
+            regels.append("")
+            regels.append("🥧 <b>Sectorverdeling</b>")
+            for naam, gewicht in sectoren[:7]:
+                regels.append(f"• {esc(sector_nl(naam))}: {pct(gewicht)}")
+        fonds_omschrijving = kort_omschrijving(k.get("omschrijving"), maxlen=450)
+        if fonds_omschrijving:
+            regels.append("")
+            regels.append("ℹ️ <b>Wat doet dit fonds?</b>")
+            regels.append(esc(fonds_omschrijving))
+    else:
+        bedrijf_omschrijving = kort_omschrijving(k.get("omschrijving"), maxlen=550)
+        if bedrijf_omschrijving:
+            regels.append("")
+            regels.append("🏢 <b>Wat doet dit bedrijf?</b>")
+            regels.append(esc(bedrijf_omschrijving))
 
     # ---- Koers & dag ----
     regels.append("")
@@ -389,13 +470,6 @@ def format_bericht(k, test=False):
             regels.append("")
             regels.append("🧺 <b>Fonds-info</b>")
             regels.extend(fonds)
-
-        # ---- Over dit fonds ----
-        omschrijving = kort_omschrijving(k.get("omschrijving"))
-        if omschrijving:
-            regels.append("")
-            regels.append("ℹ️ <b>Over dit fonds</b>")
-            regels.append(esc(omschrijving))
     else:
         # ---- Waardering ----
         regels.append("")
@@ -444,20 +518,16 @@ def format_bericht(k, test=False):
                 n = f" ({k['n_analisten']} analisten)" if k.get("n_analisten") else ""
                 regels.append(f"• Advies: {esc(advies)}{n}")
 
-        # ---- Over het bedrijf ----
+        # ---- Bedrijfsinfo (omschrijving staat al bovenaan) ----
         extra = []
         if k.get("land"):
             extra.append(esc(k["land"]))
         if k.get("werknemers"):
             extra.append(f"{groot_getal(k['werknemers'])} werknemers")
-        omschrijving = kort_omschrijving(k.get("omschrijving"))
-        if extra or omschrijving:
+        if extra:
             regels.append("")
-            regels.append("ℹ️ <b>Over het bedrijf</b>")
-            if extra:
-                regels.append("• " + " · ".join(extra))
-            if omschrijving:
-                regels.append(esc(omschrijving))
+            regels.append("🏢 <b>Bedrijfsinfo</b>")
+            regels.append("• " + " · ".join(extra))
 
     # ---- Links ----
     regels.append("")

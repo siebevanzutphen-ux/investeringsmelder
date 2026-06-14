@@ -31,9 +31,19 @@ WATCHLIST = [
     "XLK", "XLF", "XLV", "XLE", "XLU", "XLP", "XLI",
 ]
 
-MIN_DALING = 8.0        # % daling minimum
-MIN_MARKTCAP = 10e9     # minimaal €10 miljard marktcap
-MIN_LEEFTIJD_JAAR = 10  # bedrijf minimaal 10 jaar oud
+# Welke tickers zijn ETF's / indexfondsen (breed gespreid, veiliger).
+# Wordt aangevuld met automatische detectie via quoteType.
+ETF_TICKERS = {
+    "VTI", "VOO", "SPY", "QQQ", "IWM", "EFA", "VEA", "VWO",
+    "IEFA", "ACWI", "VT", "SCHD", "VIG", "BND", "AGG",
+    "XLK", "XLF", "XLV", "XLE", "XLU", "XLP", "XLI",
+}
+
+MIN_DALING_AANDEEL = 8.0  # % daling minimum voor losse aandelen
+MIN_DALING_ETF = 4.0      # % daling minimum voor ETF's/indexfondsen (eerder melden: veiliger)
+MIN_MARKTCAP = 10e9       # minimaal €10 miljard marktcap (losse aandelen)
+MIN_ETF_OMVANG = 1e9      # minimaal €1 miljard fondsomvang (ETF's)
+MIN_LEEFTIJD_JAAR = 10    # bedrijf minimaal 10 jaar oud
 
 VALUTA_SYMBOOL = {"USD": "$", "EUR": "€", "GBP": "£", "CHF": "CHF ", "JPY": "¥"}
 
@@ -156,17 +166,26 @@ def analyse_aandeel(ticker, forceer=False):
         stock = yf.Ticker(ticker)
         info = stock.info or {}
 
-        marktcap = info.get("marketCap", 0) or 0
-        if not forceer and marktcap < MIN_MARKTCAP:
-            return None
+        quote_type = (info.get("quoteType") or "").upper()
+        is_etf = quote_type in ("ETF", "MUTUALFUND") or ticker in ETF_TICKERS
 
-        # Leeftijd check (alleen in normale modus)
+        marktcap = info.get("marketCap", 0) or 0
+        fonds_omvang = info.get("totalAssets") or info.get("netAssets")
+
+        # Grootte-check (verschilt voor ETF's en aandelen)
         if not forceer:
-            eerste_handel = info.get("firstTradeDateEpochUtc")
-            if eerste_handel:
-                jaar = datetime.fromtimestamp(eerste_handel).year
-                if datetime.now().year - jaar < MIN_LEEFTIJD_JAAR:
+            if is_etf:
+                if fonds_omvang and fonds_omvang < MIN_ETF_OMVANG:
                     return None
+            else:
+                if marktcap < MIN_MARKTCAP:
+                    return None
+                # Leeftijd check (alleen losse aandelen)
+                eerste_handel = info.get("firstTradeDateEpochUtc")
+                if eerste_handel:
+                    jaar = datetime.fromtimestamp(eerste_handel).year
+                    if datetime.now().year - jaar < MIN_LEEFTIJD_JAAR:
+                        return None
 
         # Koershistorie (1 jaar) voor koers + performance + 52 weken
         hist = stock.history(period="1y")
@@ -178,15 +197,18 @@ def analyse_aandeel(ticker, forceer=False):
         prijs_vorig = float(closes.iloc[-2])
         daling_pct = (prijs_nu - prijs_vorig) / prijs_vorig * 100
 
+        drempel = MIN_DALING_ETF if is_etf else MIN_DALING_AANDEEL
         if not forceer:
-            if daling_pct > -MIN_DALING:
+            if daling_pct > -drempel:
                 return None  # Niet genoeg gedaald
-            sector = info.get("sector", "Onbekend")
-            if sector in ["Basic Materials", "Communication Services"]:
-                return None
-            pe_check = info.get("trailingPE")
-            if pe_check and pe_check < 0:
-                return None
+            # Kwaliteitsfilters alleen voor losse aandelen
+            if not is_etf:
+                sector = info.get("sector", "Onbekend")
+                if sector in ["Basic Materials", "Communication Services"]:
+                    return None
+                pe_check = info.get("trailingPE")
+                if pe_check and pe_check < 0:
+                    return None
 
         valuta = info.get("currency", "USD") or "USD"
 
@@ -207,6 +229,13 @@ def analyse_aandeel(ticker, forceer=False):
         return {
             "ticker": ticker,
             "naam": info.get("longName") or info.get("shortName") or ticker,
+            "is_etf": is_etf,
+            "quote_type": quote_type,
+            "fonds_omvang": fonds_omvang,
+            "categorie": info.get("category"),
+            "fondshuis": info.get("fundFamily"),
+            "kostenratio": info.get("annualReportExpenseRatio") or info.get("netExpenseRatio"),
+            "etf_yield": (info.get("yield") * 100) if info.get("yield") else None,
             "valuta": valuta,
             "daling": round(daling_pct, 2),
             "prijs": prijs_nu,
@@ -284,18 +313,32 @@ def format_bericht(k, test=False):
     v = k["valuta"]
     regels = []
 
+    is_etf = k.get("is_etf")
+
     # ---- Kop: korte samenvatting (zoals voorheen) ----
     if test:
         regels.append("🧪 <b>TESTBERICHT — je melder werkt!</b>")
+    if is_etf:
+        regels.append("🛡️ <b>ETF / INDEXFONDS</b> — breed gespreid, veiliger instappunt")
     kop_emoji = "📉" if k["daling"] < 0 else "📈"
     regels.append(f"{kop_emoji} <b>{esc(k['naam'])}</b> ({esc(k['ticker'])})")
     beweging = "Daling" if k["daling"] < 0 else "Stijging"
     regels.append(f"{beweging}: <b>{pct(k['daling'], plus=True)}</b> sinds vorige slotkoers")
-    regels.append(f"Prijs: <b>{geld(k['prijs'], v)}</b>  |  Cap: <b>{cap_str(k['marktcap'], v)}</b>")
-    sector_regel = esc(k["sector"])
-    if k.get("industrie"):
-        sector_regel += f" · {esc(k['industrie'])}"
-    regels.append(f"Sector: {sector_regel}")
+    if is_etf:
+        regels.append(f"Prijs: <b>{geld(k['prijs'], v)}</b>  |  Fondsomvang: <b>{cap_str(k['fonds_omvang'], v)}</b>")
+        fonds_regel = []
+        if k.get("categorie"):
+            fonds_regel.append(esc(k["categorie"]))
+        if k.get("fondshuis"):
+            fonds_regel.append(esc(k["fondshuis"]))
+        if fonds_regel:
+            regels.append("Categorie: " + " · ".join(fonds_regel))
+    else:
+        regels.append(f"Prijs: <b>{geld(k['prijs'], v)}</b>  |  Cap: <b>{cap_str(k['marktcap'], v)}</b>")
+        sector_regel = esc(k["sector"])
+        if k.get("industrie"):
+            sector_regel += f" · {esc(k['industrie'])}"
+        regels.append(f"Sector: {sector_regel}")
 
     # ---- Koers & dag ----
     regels.append("")
@@ -331,67 +374,90 @@ def format_bericht(k, test=False):
     if k.get("boven_bodem") is not None:
         regels.append(f"• {pct(k['boven_bodem'], plus=True)} t.o.v. jaarbodem")
 
-    # ---- Waardering ----
-    regels.append("")
-    regels.append("💰 <b>Waardering</b>")
-    regels.append(f"• K/W (P/E): {getal(k['pe'], 1)}   |   verwacht: {getal(k['forward_pe'], 1)}")
-    if k.get("peg"):
-        regels.append(f"• PEG: {getal(k['peg'], 2)}")
-    if k.get("koers_boek"):
-        regels.append(f"• Koers/boekwaarde: {getal(k['koers_boek'], 2)}")
-    if k.get("eps") is not None:
-        regels.append(f"• Winst per aandeel: {geld(k['eps'], v)}")
-    if k.get("div_rend") is not None:
-        div = f"• Dividendrendement: {pct(k['div_rend'])}"
-        if k.get("payout") is not None:
-            div += f" (uitkering {pct(k['payout'])} v.d. winst)"
-        regels.append(div)
+    if is_etf:
+        # ---- Fonds-info (ETF / indexfonds) ----
+        fonds = []
+        if k.get("kostenratio") is not None:
+            fonds.append(f"• Kostenratio (TER): {pct(k['kostenratio'] * 100)} per jaar")
+        if k.get("etf_yield") is not None:
+            fonds.append(f"• Dividendrendement: {pct(k['etf_yield'])}")
+        elif k.get("div_rend") is not None:
+            fonds.append(f"• Dividendrendement: {pct(k['div_rend'])}")
+        if k.get("beta") is not None:
+            fonds.append(f"• Beta (beweeglijkheid): {getal(k['beta'], 2)}")
+        if fonds:
+            regels.append("")
+            regels.append("🧺 <b>Fonds-info</b>")
+            regels.extend(fonds)
 
-    # ---- Bedrijfsgezondheid ----
-    gezond = []
-    if k.get("omzetgroei") is not None:
-        gezond.append(f"• Omzetgroei (j-o-j): {pct(k['omzetgroei'], plus=True)}")
-    if k.get("winstmarge") is not None:
-        gezond.append(f"• Winstmarge: {pct(k['winstmarge'])}")
-    if k.get("roe") is not None:
-        gezond.append(f"• Rendement eigen vermogen (ROE): {pct(k['roe'])}")
-    if k.get("schuld_ev") is not None:
-        gezond.append(f"• Schuld/eigen vermogen: {getal(k['schuld_ev'], 0)}")
-    if k.get("beta") is not None:
-        gezond.append(f"• Beta (beweeglijkheid): {getal(k['beta'], 2)}")
-    if gezond:
-        regels.append("")
-        regels.append("🏦 <b>Bedrijfsgezondheid</b>")
-        regels.extend(gezond)
-
-    # ---- Analisten ----
-    if k.get("doel") or k.get("advies"):
-        regels.append("")
-        regels.append("👥 <b>Analisten</b>")
-        if k.get("doel"):
-            doelregel = f"• Koersdoel (gem.): {geld(k['doel'], v)}"
-            if k.get("opwaarts") is not None:
-                doelregel += f"  →  {pct(k['opwaarts'], plus=True)} potentieel"
-            regels.append(doelregel)
-        if k.get("advies"):
-            advies = ADVIES_NL.get(k["advies"], k["advies"])
-            n = f" ({k['n_analisten']} analisten)" if k.get("n_analisten") else ""
-            regels.append(f"• Advies: {esc(advies)}{n}")
-
-    # ---- Over het bedrijf ----
-    extra = []
-    if k.get("land"):
-        extra.append(esc(k["land"]))
-    if k.get("werknemers"):
-        extra.append(f"{groot_getal(k['werknemers'])} werknemers")
-    omschrijving = kort_omschrijving(k.get("omschrijving"))
-    if extra or omschrijving:
-        regels.append("")
-        regels.append("ℹ️ <b>Over het bedrijf</b>")
-        if extra:
-            regels.append("• " + " · ".join(extra))
+        # ---- Over dit fonds ----
+        omschrijving = kort_omschrijving(k.get("omschrijving"))
         if omschrijving:
+            regels.append("")
+            regels.append("ℹ️ <b>Over dit fonds</b>")
             regels.append(esc(omschrijving))
+    else:
+        # ---- Waardering ----
+        regels.append("")
+        regels.append("💰 <b>Waardering</b>")
+        regels.append(f"• K/W (P/E): {getal(k['pe'], 1)}   |   verwacht: {getal(k['forward_pe'], 1)}")
+        if k.get("peg"):
+            regels.append(f"• PEG: {getal(k['peg'], 2)}")
+        if k.get("koers_boek"):
+            regels.append(f"• Koers/boekwaarde: {getal(k['koers_boek'], 2)}")
+        if k.get("eps") is not None:
+            regels.append(f"• Winst per aandeel: {geld(k['eps'], v)}")
+        if k.get("div_rend") is not None:
+            div = f"• Dividendrendement: {pct(k['div_rend'])}"
+            if k.get("payout") is not None:
+                div += f" (uitkering {pct(k['payout'])} v.d. winst)"
+            regels.append(div)
+
+        # ---- Bedrijfsgezondheid ----
+        gezond = []
+        if k.get("omzetgroei") is not None:
+            gezond.append(f"• Omzetgroei (j-o-j): {pct(k['omzetgroei'], plus=True)}")
+        if k.get("winstmarge") is not None:
+            gezond.append(f"• Winstmarge: {pct(k['winstmarge'])}")
+        if k.get("roe") is not None:
+            gezond.append(f"• Rendement eigen vermogen (ROE): {pct(k['roe'])}")
+        if k.get("schuld_ev") is not None:
+            gezond.append(f"• Schuld/eigen vermogen: {getal(k['schuld_ev'], 0)}")
+        if k.get("beta") is not None:
+            gezond.append(f"• Beta (beweeglijkheid): {getal(k['beta'], 2)}")
+        if gezond:
+            regels.append("")
+            regels.append("🏦 <b>Bedrijfsgezondheid</b>")
+            regels.extend(gezond)
+
+        # ---- Analisten ----
+        if k.get("doel") or k.get("advies"):
+            regels.append("")
+            regels.append("👥 <b>Analisten</b>")
+            if k.get("doel"):
+                doelregel = f"• Koersdoel (gem.): {geld(k['doel'], v)}"
+                if k.get("opwaarts") is not None:
+                    doelregel += f"  →  {pct(k['opwaarts'], plus=True)} potentieel"
+                regels.append(doelregel)
+            if k.get("advies"):
+                advies = ADVIES_NL.get(k["advies"], k["advies"])
+                n = f" ({k['n_analisten']} analisten)" if k.get("n_analisten") else ""
+                regels.append(f"• Advies: {esc(advies)}{n}")
+
+        # ---- Over het bedrijf ----
+        extra = []
+        if k.get("land"):
+            extra.append(esc(k["land"]))
+        if k.get("werknemers"):
+            extra.append(f"{groot_getal(k['werknemers'])} werknemers")
+        omschrijving = kort_omschrijving(k.get("omschrijving"))
+        if extra or omschrijving:
+            regels.append("")
+            regels.append("ℹ️ <b>Over het bedrijf</b>")
+            if extra:
+                regels.append("• " + " · ".join(extra))
+            if omschrijving:
+                regels.append(esc(omschrijving))
 
     # ---- Links ----
     regels.append("")
@@ -428,26 +494,27 @@ def main():
             kansen.append(resultaat)
             print(f"✅ Gevonden: {ticker} {resultaat['daling']}%")
 
-    # Sorteer op grootste daling
-    kansen.sort(key=lambda x: x["daling"])
+    # Sorteer: ETF's/indexfondsen eerst (veiliger, eerder kopen), dan op grootste daling
+    kansen.sort(key=lambda x: (not x.get("is_etf"), x["daling"]))
 
     if not kansen:
         print("Geen kansen gevonden.")
         return
 
-    # Stuur de grootste daler met volledige info
+    # Stuur de belangrijkste kans (ETF gaat voor) met volledige info
     beste = kansen[0]
     bericht = format_bericht(beste)
 
-    # Andere dalers kort vermelden, zodat je niets mist
+    # Andere dalers kort vermelden, zodat je niets mist (ETF's met schild)
     if len(kansen) > 1:
         andere = "  •  ".join(
-            f"{esc(x['ticker'])} {pct(x['daling'], plus=True)}" for x in kansen[1:5]
+            f"{'🛡️ ' if x.get('is_etf') else ''}{esc(x['ticker'])} {pct(x['daling'], plus=True)}"
+            for x in kansen[1:6]
         )
         bericht += f"\n\n🔎 <b>Ook gedaald vandaag:</b> {andere}"
 
     stuur_telegram(bericht)
-    print(f"Melding verstuurd: {beste['ticker']}")
+    print(f"Melding verstuurd: {beste['ticker']} (ETF: {beste.get('is_etf')})")
 
 
 if __name__ == "__main__":

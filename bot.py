@@ -1,4 +1,5 @@
 import os
+import json
 import html
 import yfinance as yf
 import requests
@@ -44,6 +45,11 @@ MIN_DALING_ETF = 4.0      # % daling minimum voor ETF's/indexfondsen (eerder mel
 MIN_MARKTCAP = 10e9       # minimaal €10 miljard marktcap (losse aandelen)
 MIN_ETF_OMVANG = 1e9      # minimaal €1 miljard fondsomvang (ETF's)
 MIN_LEEFTIJD_JAAR = 10    # bedrijf minimaal 10 jaar oud
+
+# Anti-dubbele-melding: alleen opnieuw melden als er genoeg veranderd is.
+STATE_FILE = "verzonden.json"
+TOL_DALING_PP = 0.5       # daling moet >= 0,5 procentpunt verschillen om opnieuw te melden
+TOL_PRIJS = 0.005         # of de prijs >= 0,5% verschillen
 
 VALUTA_SYMBOOL = {"USD": "$", "EUR": "€", "GBP": "£", "CHF": "CHF ", "JPY": "¥"}
 
@@ -134,6 +140,37 @@ def perf_ytd(closes):
     if dit_jaar.empty:
         return None
     return (closes.iloc[-1] / dit_jaar.iloc[0] - 1) * 100
+
+
+# ----------------- Geheugen (anti-dubbele meldingen) -----------------
+
+def laad_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def bewaar_state(state):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"State opslaan mislukt: {e}")
+
+
+def is_veranderd(k, state):
+    """True als dit een nieuwe kans is of genoeg veranderd sinds de vorige melding."""
+    vorig = state.get(k["ticker"])
+    if not vorig:
+        return True  # nooit eerder gemeld
+    if abs(k["daling"] - vorig.get("daling", 0)) >= TOL_DALING_PP:
+        return True
+    vorige_prijs = vorig.get("prijs")
+    if vorige_prijs and abs(k["prijs"] / vorige_prijs - 1) >= TOL_PRIJS:
+        return True
+    return False
 
 
 # ----------------- Telegram -----------------
@@ -571,20 +608,33 @@ def main():
         print("Geen kansen gevonden.")
         return
 
+    # Alleen nieuwe of veranderde kansen melden (geen dubbele meldingen)
+    state = laad_state()
+    te_melden = [x for x in kansen if is_veranderd(x, state)]
+    if not te_melden:
+        print("Niets nieuws sinds de vorige melding — geen bericht gestuurd.")
+        return
+
     # Stuur de belangrijkste kans (ETF gaat voor) met volledige info
-    beste = kansen[0]
+    beste = te_melden[0]
     bericht = format_bericht(beste)
 
     # Andere dalers kort vermelden, zodat je niets mist (ETF's met schild)
-    if len(kansen) > 1:
+    if len(te_melden) > 1:
         andere = "  •  ".join(
             f"{'🛡️ ' if x.get('is_etf') else ''}{esc(x['ticker'])} {pct(x['daling'], plus=True)}"
-            for x in kansen[1:6]
+            for x in te_melden[1:6]
         )
         bericht += f"\n\n🔎 <b>Ook gedaald vandaag:</b> {andere}"
 
-    stuur_telegram(bericht)
-    print(f"Melding verstuurd: {beste['ticker']} (ETF: {beste.get('is_etf')})")
+    if stuur_telegram(bericht):
+        vandaag = datetime.now().strftime("%Y-%m-%d")
+        for x in te_melden:
+            state[x["ticker"]] = {"daling": x["daling"], "prijs": round(x["prijs"], 4), "datum": vandaag}
+        bewaar_state(state)
+        print(f"Melding verstuurd: {beste['ticker']} (+{len(te_melden) - 1} andere). Geheugen bijgewerkt.")
+    else:
+        print("Telegram-verzending mislukt; geheugen niet bijgewerkt.")
 
 
 if __name__ == "__main__":
